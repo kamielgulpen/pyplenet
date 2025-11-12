@@ -19,7 +19,6 @@ def find_nodes(G, **attrs):
         int is the group ID
     """
     attrs_key = tuple(sorted(attrs.items()))
-    
     group_id = G.attrs_to_group[attrs_key]
     if group_id is None:
         return []

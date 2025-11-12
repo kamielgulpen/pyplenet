@@ -1,3 +1,5 @@
+import networkx as nx
+
 """
 Network statistics computation module.
 
@@ -378,40 +380,65 @@ def _fit_and_plot_power_law(ax, degrees_sorted, distribution_name, color='bo'):
             head_degrees = unique_degrees[:head_end_idx + 1]
             head_cum_prob = cum_prob[:head_end_idx + 1]
             
-            # Filter out zero probabilities for log fitting
-            valid_indices = [i for i, p in enumerate(head_cum_prob) if p > 0]
+            # Filter out zero probabilities and degrees <= 0 for log fitting
+            valid_indices = [i for i, (d, p) in enumerate(zip(head_degrees, head_cum_prob)) 
+                           if p > 0 and d > 0]
+
+            print(f"Valid indices: {valid_indices}")
+            
             if len(valid_indices) > 3:
                 head_degrees_valid = [head_degrees[i] for i in valid_indices]
                 head_cum_prob_valid = [head_cum_prob[i] for i in valid_indices]
                 
+                print(f"Degrees: {head_degrees_valid}")
+                print(f"Cum prob: {head_cum_prob_valid}")
+                
                 # Fit in log-log space: log(P(X >= k)) = -α * log(k) + C
-                # Note: α is the CDF exponent, related to PDF exponent γ by α = γ - 1
                 log_degrees = np.log10(head_degrees_valid)
                 log_cum_prob = np.log10(head_cum_prob_valid)
-                slope, intercept = np.polyfit(log_degrees, log_cum_prob, 1)
                 
-                # Calculate both exponents for clarity
-                alpha_cdf = -slope  # Exponent for P(X >= k) ∝ k^(-α)
-                gamma_pdf = alpha_cdf + 1  # Exponent for P(k) ∝ k^(-γ)
-                
-                # Plot fitted line
-                fitted_cum_prob = 10**(slope * log_degrees + intercept)
-                ax.loglog(head_degrees_valid, fitted_cum_prob, 'r-', 
-                         label=f'Power law: γ = {gamma_pdf:.2f} (α = {alpha_cdf:.2f})', linewidth=2)
-                
-                # Mark x_max (end of power law fit at 90% threshold)
-                x_max = head_degrees_valid[-1]
-                ax.axvline(x=x_max, color='purple', linestyle='--', 
-                          alpha=0.7, label=f'head cutoff')
-                 
-                fit_results = {
-                    'alpha_cdf': alpha_cdf,    # CDF exponent
-                    'gamma_pdf': gamma_pdf,    # PDF exponent (traditional)
-                    'alpha': gamma_pdf,        # For backward compatibility, use γ
-                    'x_max': x_max
-                }
-                
-                ax.legend()
+                # Check for invalid values after log transform
+                if (np.isfinite(log_degrees).all() and 
+                    np.isfinite(log_cum_prob).all() and 
+                    len(np.unique(log_degrees)) > 1):  # Need distinct x values
+                    
+                    try:
+                        # Use polyfit with error handling
+                        slope, intercept = np.polyfit(log_degrees, log_cum_prob, 1)
+                        
+                        # Calculate both exponents for clarity
+                        alpha_cdf = -slope  # Exponent for P(X >= k) ∝ k^(-α)
+                        gamma_pdf = alpha_cdf + 1  # Exponent for P(k) ∝ k^(-γ)
+                        
+                        # Plot fitted line
+                        fitted_cum_prob = 10**(slope * log_degrees + intercept)
+                        ax.loglog(head_degrees_valid, fitted_cum_prob, 'r-', 
+                                 label=f'Power law: γ = {gamma_pdf:.2f} (α = {alpha_cdf:.2f})', 
+                                 linewidth=2)
+                        
+                        # Mark x_max (end of power law fit at 90% threshold)
+                        x_max = head_degrees_valid[-1]
+                        ax.axvline(x=x_max, color='purple', linestyle='--', 
+                                  alpha=0.7, label=f'head cutoff')
+                         
+                        fit_results = {
+                            'alpha_cdf': alpha_cdf,    # CDF exponent
+                            'gamma_pdf': gamma_pdf,    # PDF exponent (traditional)
+                            'alpha': gamma_pdf,        # For backward compatibility, use γ
+                            'x_max': x_max
+                        }
+                        
+                        ax.legend()
+                        
+                    except np.linalg.LinAlgError as e:
+                        print(f"Warning: Could not fit power law for {distribution_name}: {e}")
+                        print(f"Log degrees: {log_degrees}")
+                        print(f"Log cum prob: {log_cum_prob}")
+                else:
+                    print(f"Warning: Invalid data for {distribution_name} after log transform")
+                    print(f"Log degrees finite: {np.isfinite(log_degrees).all()}")
+                    print(f"Log cum prob finite: {np.isfinite(log_cum_prob).all()}")
+                    print(f"Unique log degrees: {len(np.unique(log_degrees))}")
     
     ax.set_title(f"{distribution_name} Cumulative Distribution")
     ax.set_xlabel("Degree")
@@ -528,16 +555,23 @@ def runstats(G, show_plots=True, sample_size=100):
     print()
     
     # Reciprocity
-    reciprocity = calculate_reciprocity(G)
+    reciprocity = nx.overall_reciprocity(G)
     print(f"Reciprocity: {reciprocity:.4f}")
     
     # Clustering coefficient
-    avg_clustering = calculate_clustering_coefficient(G, sample_size)
+    avg_transitivity = nx.transitivity(G)
+    print(f"Average clustering coefficient: {avg_transitivity:.4f}")
+
+    avg_clustering = nx.average_clustering(G)
     print(f"Average clustering coefficient: {avg_clustering:.4f}")
     
     # Shortest path lengths
     print("Calculating shortest path distribution...")
-    path_lengths = shortest_path_sample(G, sample_size)
+    path_lengths = [length 
+                for source, targets in nx.all_pairs_shortest_path_length(G)
+                for target, length in targets.items() 
+                if source < target] 
+
     
     if path_lengths and show_plots:
         plt.figure(figsize=(8, 5))
@@ -557,7 +591,10 @@ def runstats(G, show_plots=True, sample_size=100):
     
     # Degree statistics
     print("Calculating degree distribution...")
-    in_degrees, out_degrees = degree_distribution(G)
+    # in_degrees, out_degrees = degree_distribution(G)
+    in_degrees, out_degrees =(sorted((d for n, d in G.in_degree()), reverse=True), sorted((d for n, d in G.out_degree()), reverse=True), )
+
+    print(in_degrees, out_degrees)
     
     if out_degrees:
         avg_out_degree = np.mean(out_degrees)
