@@ -61,7 +61,8 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
         # Instead we allow some duplicate edges.
         if s != d_from_db:
             G.add_edge(s, d_from_db)
-            num_links += 1
+            # num_links += 1
+            G.existing_num_links[(src_id, dst_id)] += 1
             
             # reciprocity - add reverse edge
             if random.uniform(0,1) < reciprocity_p:
@@ -79,6 +80,6 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
         attempts += 1
     
     #print(f" | links added: {num_links - n0_links} ", end="")
-    G.existing_num_links[(src_id, dst_id)] += (num_links - n0_links)
+    # G.existing_num_links[(src_id, dst_id)] += (num_links - n0_links)
     
     return link_n_check

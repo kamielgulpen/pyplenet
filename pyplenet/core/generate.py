@@ -31,6 +31,77 @@ from pyplenet.core.utils import (find_nodes, read_file, desc_groups)
 from pyplenet.core.grn import establish_links
 from pyplenet.core.graph import FileBasedGraph
 
+def init_communities(G, df, num_of_communities):
+    """
+    Vectorized community assignment based on edge probabilities for FileBasedGraph.
+
+    Parameters
+    ----------
+    G : FileBasedGraph
+        The graph object with nodes already initialized.
+    df : pandas.DataFrame
+        DataFrame with columns 'group1', 'group2', and 'edge_count' describing
+        edge probabilities between groups.
+    num_of_communities : int
+        Number of communities to create.
+
+    Returns
+    -------
+    dict
+        Mapping from node_id to community_id (int from 0 to num_of_communities-1).
+    """
+    nodes = list(G.nodes())
+    n_nodes = len(nodes)
+
+    # Create group mapping
+    groups = sorted(set(df['group1'].unique()) | set(df['group2'].unique()))
+    group_to_idx = {g: i for i, g in enumerate(groups)}
+    n_groups = len(groups)
+
+    # Build edge probability matrix
+    edge_prob_matrix = np.zeros((n_groups, n_groups))
+    total_edges = df['edge_count'].sum()
+    for _, row in df.iterrows():
+        i, j = group_to_idx[row['group1']], group_to_idx[row['group2']]
+        prob = row['edge_count'] / total_edges
+        edge_prob_matrix[i, j] = prob
+        edge_prob_matrix[j, i] = prob
+
+    # Map nodes to group indices using FileBasedGraph's node_attributes
+    node_groups = np.array([
+        group_to_idx.get(G.node_attributes[node].get('group'), -1)
+        for node in nodes
+    ])
+
+    # Initialize community assignments randomly
+    assignments = np.random.randint(0, num_of_communities, n_nodes)
+
+    # Iterative refinement (single loop)
+    for _ in range(10):  # Few iterations for convergence
+        # Calculate community-group densities
+        comm_group_counts = np.zeros((num_of_communities, n_groups))
+        valid_mask = node_groups >= 0
+        np.add.at(comm_group_counts,
+                  (assignments[valid_mask], node_groups[valid_mask]), 1)
+
+        # Calculate probabilities for all nodes at once
+        probs = np.zeros((n_nodes, num_of_communities))
+        valid_nodes = node_groups >= 0
+        if valid_nodes.any():
+            probs[valid_nodes] = edge_prob_matrix[node_groups[valid_nodes]] @ comm_group_counts.T
+
+        # Reassign based on probabilities
+        probs_sum = probs.sum(axis=1, keepdims=True)
+        probs = np.where(probs_sum > 0, probs / probs_sum, 1/num_of_communities)
+
+        # Probabilistic assignment
+        assignments = np.array([
+            np.random.choice(num_of_communities, p=probs[i])
+            for i in range(n_nodes)
+        ])
+
+    return {nodes[i]: assignments[i] for i in range(n_nodes)}
+
 def init_nodes(G, pops_path, scale = 1):
     """
     Initialize nodes in the graph from population data.
@@ -147,7 +218,19 @@ def init_links(G, links_path, fraction, scale, reciprocity_p):
     
     df_n_group_links = read_file(links_path)
     print(f"Total requested links: {int(df_n_group_links['n'].sum() * links_scale)}")
-   
+    
+    print("Preparing maximum number of linkes")
+    for idx, row in df_n_group_links.iterrows():
+        src_attrs = {k.replace('_src', ''): row[k] for k in row.index if k.endswith('_src')}
+        dst_attrs = {k.replace('_dst', ''): row[k] for k in row.index if k.endswith('_dst')}
+
+        src_nodes, src_id = find_nodes(G, **src_attrs)
+        dst_nodes, dst_id = find_nodes(G, **dst_attrs)
+
+        G.maximum_num_links = {}
+        G.maximum_num_links[(src_id, dst_id)] = row['n']
+
+
     total_rows = len(df_n_group_links)
     for idx, row in df_n_group_links.iterrows():
         
