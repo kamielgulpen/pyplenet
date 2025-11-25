@@ -182,6 +182,7 @@ def init_nodes(G, pops_path, scale = 1):
     """
     group_desc_dict, characteristic_cols = desc_groups(pops_path)
 
+    G.nr_of_total_pop_nodes = read_file(pops_path).n.sum()
     group_to_attrs = {}
     group_to_nodes = {}
     nodes_to_group = {}
@@ -260,9 +261,9 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p, nu
     
     check_bool = True
     warnings = []
-    links_scale = scale**1.5
-    
+
     df_n_group_links = read_file(links_path)
+    links_scale = scale
 
     print("Preparing maximum number of linkes")
     G.maximum_num_links = {}
@@ -326,6 +327,121 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p, nu
         for warning in warnings:
             print(warning)
 
+def fill_unfulfilled_group_pairs(G, reciprocity_p):
+    """
+    For each group pair that hasn't reached its maximum number of edges,
+    randomly create edges between nodes from source and destination groups.
+
+    Parameters
+    ----------
+    G : NetworkXGraph
+        The graph object with existing edges
+    reciprocity_p : float
+        Probability of creating reciprocal edges (0-1)
+
+    Returns
+    -------
+    dict
+        Statistics about fulfilled and unfulfilled group pairs
+    """
+    import random
+
+    print("\nFilling unfulfilled group pairs...")
+    print("-" * 50)
+
+    unfulfilled_pairs = []
+    fulfilled_pairs = []
+    stats = {
+        'total_pairs': 0,
+        'fulfilled_pairs': 0,
+        'unfulfilled_pairs': 0,
+        'edges_added': 0,
+        'reciprocal_edges_added': 0
+    }
+
+    # Calculate and display stats for each group pair
+    for (src_id, dst_id) in G.maximum_num_links.keys():
+        existing = G.existing_num_links.get((src_id, dst_id), 0)
+        maximum = G.maximum_num_links[(src_id, dst_id)]
+
+        stats['total_pairs'] += 1
+
+        if maximum == 0:
+            continue
+
+        if existing < maximum:
+            unfulfilled_pairs.append((src_id, dst_id, existing, maximum))
+            stats['unfulfilled_pairs'] += 1
+        else:
+            fulfilled_pairs.append((src_id, dst_id, existing, maximum))
+            stats['fulfilled_pairs'] += 1
+
+    print(f"Total group pairs: {stats['total_pairs']}")
+    print(f"Fulfilled pairs: {stats['fulfilled_pairs']}")
+    print(f"Unfulfilled pairs: {stats['unfulfilled_pairs']}")
+    print()
+
+    # Fill unfulfilled pairs
+    if unfulfilled_pairs:
+        print("Filling unfulfilled pairs with random edges...")
+
+        for src_id, dst_id, existing, maximum in unfulfilled_pairs:
+            needed = maximum - existing
+
+            # Get nodes from source and destination groups
+            src_nodes = G.group_to_nodes.get(src_id, [])
+            dst_nodes = G.group_to_nodes.get(dst_id, [])
+
+            if not src_nodes or not dst_nodes:
+                continue
+
+            attempts = 0
+            max_attempts = needed * 20
+            edges_added_for_pair = 0
+
+            while edges_added_for_pair < needed and attempts < max_attempts:
+                # Select random nodes
+                src_node = random.choice(src_nodes)
+                dst_node = random.choice(dst_nodes)
+
+                # Check if edge can be added (no self-loops, no duplicates)
+                if src_node != dst_node and not G.graph.has_edge(src_node, dst_node):
+                    G.graph.add_edge(src_node, dst_node)
+                    edges_added_for_pair += 1
+                    G.existing_num_links[(src_id, dst_id)] += 1
+                    stats['edges_added'] += 1
+
+                    # Add reciprocal edge with probability reciprocity_p
+                    if random.uniform(0, 1) < reciprocity_p:
+                        # Check if reciprocal pair exists and has capacity
+                        if (dst_id, src_id) in G.maximum_num_links:
+                            current_reciprocal = G.existing_num_links.get((dst_id, src_id), 0)
+                            max_reciprocal = G.maximum_num_links[(dst_id, src_id)]
+
+                            # Only add if under limit and edge doesn't exist
+                            if current_reciprocal < max_reciprocal and not G.graph.has_edge(dst_node, src_node):
+                                G.graph.add_edge(dst_node, src_node)
+                                G.existing_num_links[(dst_id, src_id)] += 1
+                                stats['reciprocal_edges_added'] += 1
+
+                                # If self-loop group pair, count it toward the main pair too
+                                if dst_id == src_id:
+                                    edges_added_for_pair += 1
+                                    stats['edges_added'] += 1
+
+                attempts += 1
+
+            if edges_added_for_pair < needed:
+                print(f"  Warning: Group pair ({src_id}, {dst_id}) - "
+                      f"Only added {edges_added_for_pair}/{needed} edges "
+                      f"(reached max attempts)")
+
+    print(f"\nTotal edges added: {stats['edges_added']}")
+    print(f"Total reciprocal edges added: {stats['reciprocal_edges_added']}")
+    print("-" * 50)
+
+    return stats
+
 def generate(pops_path, links_path, preferential_attachment, scale, reciprocity, transitivity, number_of_communities, base_path="graph_data"):
     """
     Generate a population-based network using NetworkX.
@@ -371,6 +487,9 @@ def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
     print("-----------------")
     print("Network Generated")
     print()
+
+    # Fill any unfulfilled group pairs with random edges
+    fill_unfulfilled_group_pairs(G, reciprocity)
 
     G.finalize()
 

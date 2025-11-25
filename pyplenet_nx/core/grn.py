@@ -37,7 +37,7 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
     """
     link_n_check = True
     attempts = 0
-    max_attempts = target_link_count * 100  # Increased to allow for more duplicate attempts
+    max_attempts = target_link_count * 10  # Increased to allow for more duplicate attempts
 
     # Get current link count
     num_links = G.existing_num_links.get((src_id, dst_id), 0)
@@ -97,12 +97,10 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
 
             # Reciprocity
             if random.uniform(0,1) < reciprocity_p:
-                if not G.graph.has_edge(d_from_db, s):
+                if G.existing_num_links[(dst_id, src_id)] < G.maximum_num_links[(dst_id, src_id)] and not G.graph.has_edge(d_from_db, s):
                     G.graph.add_edge(d_from_db, s)
-                    if (dst_id, src_id) not in G.existing_num_links:
-                        G.existing_num_links[(dst_id, src_id)] = 0
                     G.existing_num_links[(dst_id, src_id)] += 1
-                    if (dst_id == src_id) & (src_id == dst_id):
+                    if (dst_id == src_id):
                         num_links += 1
                         G.existing_num_links[(src_id, dst_id)] = num_links
 
