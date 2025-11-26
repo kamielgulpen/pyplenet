@@ -98,11 +98,6 @@ def populate_communities(G, num_communities, seed_groups):
     # Initialize community affinity matrix with slight bias
     community_matrix = np.ones((num_communities, n_groups))
 
-    # Initialize storage dictionaries
-    communities_to_nodes = {}
-    nodes_to_communities = {}
-    communities_to_groups = {}
-
     # Handle single community case
     if num_communities == 1:
         seed_groups = [seed_groups[0]]
@@ -111,8 +106,8 @@ def populate_communities(G, num_communities, seed_groups):
     for community_idx, seed_group in enumerate(seed_groups):
         community_matrix[community_idx, seed_group] += 1
         for group_id in range(n_groups):
-            communities_to_nodes[(community_idx, group_id)] = []
-        communities_to_groups[community_idx] = []
+            G.communities_to_nodes[(community_idx, group_id)] = []
+        G.communities_to_groups[community_idx] = []
 
     # Assign each node to a community based on group probabilities
     for node in G.graph.nodes:
@@ -128,14 +123,9 @@ def populate_communities(G, num_communities, seed_groups):
 
         # Update community information
         community_matrix[community, group] += 1
-        communities_to_nodes[(community, group)].append(node)
-        nodes_to_communities[node] = community
-        communities_to_groups[community].append(group)
-
-    # Store community assignments in graph
-    G.communities_to_nodes = communities_to_nodes
-    G.nodes_to_communities = nodes_to_communities
-    G.communities_to_groups = communities_to_groups
+        G.communities_to_nodes[(community, group)].append(node)
+        G.nodes_to_communities[node] = community
+        G.communities_to_groups[community].append(group)
  
 
 def find_separated_groups(G, num_communities, verbose=False):
@@ -159,7 +149,7 @@ def find_separated_groups(G, num_communities, verbose=False):
     list
         Group IDs selected as community seeds
     """
-    n_groups = int(np.sqrt(len(G.maximum_num_links)))
+    n_groups = len(G.group_ids)
 
     # Create affinity matrix from link counts
     affinity = np.zeros((n_groups, n_groups))
@@ -174,7 +164,7 @@ def find_separated_groups(G, num_communities, verbose=False):
     # Store for later use in community assignment
     G.probability_matrix = normalized.copy()
     G.number_of_communities = num_communities
-
+    
     # Start greedy selection with two least connected groups
     selected_indices = []
     remaining = set(range(n_groups))
@@ -231,39 +221,28 @@ def init_nodes(G, pops_path, scale=1, pop_column='n'):
     """
     group_desc_dict, characteristic_cols = desc_groups(pops_path, pop_column=pop_column)
 
-    G.nr_of_total_pop_nodes = read_file(pops_path)[pop_column].sum()
-    group_to_attrs = {}
-    group_to_nodes = {}
-    nodes_to_group = {}
-
     node_id = 0
     for group_id, group_info in group_desc_dict.items():
         attrs = {col: group_info[col] for col in characteristic_cols}
-        group_to_attrs[group_id] = attrs
+        G.group_to_attrs[group_id] = attrs
         n_nodes = int(np.ceil(scale * group_info[pop_column]))
-        group_to_nodes[group_id] = list(range(node_id, node_id + n_nodes))
+        G.group_to_nodes[group_id] = list(range(node_id, node_id + n_nodes))
 
         # Add nodes using NetworkX directly with community attribute
         for _ in range(n_nodes):
+
             G.graph.add_node(node_id, **attrs)
-            nodes_to_group[node_id] = group_id
+            G.nodes_to_group[node_id] = group_id
             node_id += 1
 
-
     # Create attribute to group mapping
-    attrs_to_group = {}
-    for group_id, attrs in group_to_attrs.items():
+    for group_id, attrs in G.group_to_attrs.items():
         attrs_key = tuple(sorted(attrs.items()))
-        attrs_to_group[attrs_key] = group_id
-
-    # Store metadata in wrapper
-    G.attrs_to_group = attrs_to_group
-    G.group_to_attrs = group_to_attrs
-    G.group_to_nodes = group_to_nodes
-    G.nodes_to_group = nodes_to_group
+        G.attrs_to_group[attrs_key] = group_id
 
     # Initialize link tracking
-    group_ids = list(group_to_attrs.keys())
+    group_ids = list(G.group_to_attrs.keys())
+    G.group_ids = group_ids
     G.existing_num_links = {(src, dst): 0 for src in group_ids for dst in group_ids}
 
 def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
@@ -308,7 +287,7 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
         print("Calculating link requirements...")
 
     # Initialize maximum link counts for all group pairs
-    group_ids = range(240)
+    group_ids = G.group_ids
     G.maximum_num_links = {(i, j): 0 for i in group_ids for j in group_ids}
 
     # Calculate required links for each group pair

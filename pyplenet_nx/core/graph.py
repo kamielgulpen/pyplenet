@@ -24,6 +24,7 @@ Examples
 """
 
 import networkx as nx
+import numpy as np
 import json
 import os
 
@@ -76,8 +77,13 @@ class NetworkXGraph:
         self.group_to_attrs = {}
         self.group_to_nodes = {}
         self.nodes_to_group = {}
+        self.communities_to_nodes = {}
+        self.nodes_to_communities = {}
+        self.communities_to_groups = {}
         self.existing_num_links = {}
         self.maximum_num_links = {}
+        self.probability_matrix = np.zeros((2,3))
+        self.number_of_communities = 0
 
         self._load_metadata()
 
