@@ -214,7 +214,7 @@ def find_separated_groups(G, num_communities, verbose=False):
 
     return selected_indices
 
-def init_nodes(G, pops_path, scale = 1):
+def init_nodes(G, pops_path, scale=1, pop_column='n'):
     """
     Initialize nodes from population data using NetworkX directly.
 
@@ -226,12 +226,12 @@ def init_nodes(G, pops_path, scale = 1):
         Path to population file (CSV or Excel)
     scale : float, optional
         Population scaling factor (default 1)
-    group_to_community : dict, optional
-        Mapping from group_id to community_id (from edge distribution analysis)
+    pop_column : str, optional
+        Name of the column containing population counts (default 'n')
     """
-    group_desc_dict, characteristic_cols = desc_groups(pops_path)
+    group_desc_dict, characteristic_cols = desc_groups(pops_path, pop_column=pop_column)
 
-    G.nr_of_total_pop_nodes = read_file(pops_path).n.sum()
+    G.nr_of_total_pop_nodes = read_file(pops_path)[pop_column].sum()
     group_to_attrs = {}
     group_to_nodes = {}
     nodes_to_group = {}
@@ -240,7 +240,7 @@ def init_nodes(G, pops_path, scale = 1):
     for group_id, group_info in group_desc_dict.items():
         attrs = {col: group_info[col] for col in characteristic_cols}
         group_to_attrs[group_id] = attrs
-        n_nodes = int(np.ceil(scale * group_info['n']))
+        n_nodes = int(np.ceil(scale * group_info[pop_column]))
         group_to_nodes[group_id] = list(range(node_id, node_id + n_nodes))
 
         # Add nodes using NetworkX directly with community attribute
@@ -267,7 +267,8 @@ def init_nodes(G, pops_path, scale = 1):
     G.existing_num_links = {(src, dst): 0 for src in group_ids for dst in group_ids}
 
 def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
-               number_of_communities, verbose=True):
+               number_of_communities, verbose=True,
+               src_suffix='_src', dst_suffix='_dst', link_column='n'):
     """
     Create edges in the graph based on interaction data.
 
@@ -293,6 +294,12 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
         Number of communities to create
     verbose : bool, optional
         Whether to print progress information
+    src_suffix : str, optional
+        Suffix for source group columns (default '_src')
+    dst_suffix : str, optional
+        Suffix for destination group columns (default '_dst')
+    link_column : str, optional
+        Name of column containing link counts (default 'n')
     """
     warnings = []
     df_n_group_links = read_file(links_path)
@@ -306,13 +313,13 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
 
     # Calculate required links for each group pair
     for idx, row in df_n_group_links.iterrows():
-        src_attrs = {k.replace('_src', ''): row[k] for k in row.index if k.endswith('_src')}
-        dst_attrs = {k.replace('_dst', ''): row[k] for k in row.index if k.endswith('_dst')}
+        src_attrs = {k.replace(src_suffix, ''): row[k] for k in row.index if k.endswith(src_suffix)}
+        dst_attrs = {k.replace(dst_suffix, ''): row[k] for k in row.index if k.endswith(dst_suffix)}
 
         src_nodes, src_id = find_nodes(G, **src_attrs)
         dst_nodes, dst_id = find_nodes(G, **dst_attrs)
 
-        G.maximum_num_links[(src_id, dst_id)] = int(math.ceil(row['n'] * scale))
+        G.maximum_num_links[(src_id, dst_id)] = int(math.ceil(row[link_column] * scale))
 
     if verbose:
         total_links = sum(G.maximum_num_links.values())
@@ -331,10 +338,10 @@ def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
         if verbose and ((idx + 1) % 500 == 0 or idx == 0 or idx == total_rows - 1):
             print(f"\rProcessing row {idx + 1} of {total_rows}", end="")
 
-        src_attrs = {k.replace('_src', ''): row[k] for k in row.index if k.endswith('_src')}
-        dst_attrs = {k.replace('_dst', ''): row[k] for k in row.index if k.endswith('_dst')}
+        src_attrs = {k.replace(src_suffix, ''): row[k] for k in row.index if k.endswith(src_suffix)}
+        dst_attrs = {k.replace(dst_suffix, ''): row[k] for k in row.index if k.endswith(dst_suffix)}
 
-        num_requested_links = int(math.ceil(row['n'] * scale))
+        num_requested_links = int(math.ceil(row[link_column] * scale))
 
         src_nodes, src_id = find_nodes(G, **src_attrs)
         dst_nodes, dst_id = find_nodes(G, **dst_attrs)
@@ -466,7 +473,8 @@ def fill_unfulfilled_group_pairs(G, reciprocity_p, verbose=True):
     return stats
 
 def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
-             transitivity, number_of_communities, base_path="graph_data", verbose=True):
+             transitivity, number_of_communities, base_path="graph_data", verbose=True,
+             pop_column='n', src_suffix='_src', dst_suffix='_dst', link_column='n'):
     """
     Generate a population-based network using NetworkX.
 
@@ -494,6 +502,14 @@ def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
         Directory for saving graph (default "graph_data")
     verbose : bool, optional
         Whether to print progress information
+    pop_column : str, optional
+        Column name for population counts in pops_path (default 'n')
+    src_suffix : str, optional
+        Suffix for source group columns in links_path (default '_src')
+    dst_suffix : str, optional
+        Suffix for destination group columns in links_path (default '_dst')
+    link_column : str, optional
+        Column name for link counts in links_path (default 'n')
 
     Returns
     -------
@@ -514,7 +530,7 @@ def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
     G = NetworkXGraph(base_path)
 
     # Create nodes
-    init_nodes(G, pops_path, scale)
+    init_nodes(G, pops_path, scale, pop_column=pop_column)
 
     if verbose:
         print(f"  Created {G.graph.number_of_nodes()} nodes")
@@ -525,7 +541,8 @@ def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
 
     # Create edges
     init_links(G, links_path, preferential_attachment_fraction, scale,
-              reciprocity, transitivity, number_of_communities, verbose=verbose)
+              reciprocity, transitivity, number_of_communities, verbose=verbose,
+              src_suffix=src_suffix, dst_suffix=dst_suffix, link_column=link_column)
 
     if verbose:
         print("\nStep 3: Filling remaining unfulfilled group pairs...")
