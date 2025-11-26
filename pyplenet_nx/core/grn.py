@@ -5,14 +5,16 @@ import random
 def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
                   target_link_count, fraction, reciprocity_p, transitivity_p, valid_communities=None):
     """
-    Establishes target_link_count links between src_nodes and dst_nodes using NetworkX directly.
+    Create edges between source and destination nodes with preferential attachment.
 
-    Uses bounded preferential attachment for consistent performance.
+    Connects nodes from source and destination groups using a bounded preferential
+    attachment model. Supports reciprocity and transitivity for realistic network
+    structure.
 
     Parameters
     ----------
     G : NetworkXGraph
-        Wrapper with G.graph (nx.DiGraph) and metadata
+        Graph object with network data and metadata
     src_nodes : list
         Source node IDs
     dst_nodes : list
@@ -22,74 +24,79 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
     dst_id : int
         Destination group ID
     target_link_count : int
-        Target number of links to create
+        Target number of edges to create
     fraction : float
-        Fraction for preferential attachment (0-1)
+        Preferential attachment parameter (0-1)
     reciprocity_p : float
-        Probability of reciprocal edges (0-1)
+        Probability of creating reciprocal edges (0-1)
+    transitivity_p : float
+        Probability of creating transitive edges (0-1)
     valid_communities : list, optional
-        Pre-computed list of valid community IDs (reverse lookup optimization)
+        Communities shared by both groups (precomputed for efficiency)
 
     Returns
     -------
     bool
-        True if link count is within acceptable range
+        True if target was met, False if exceeded
     """
     link_n_check = True
     attempts = 0
-    max_attempts = target_link_count * 10  # Increased to allow for more duplicate attempts
+    max_attempts = target_link_count * 10
 
-    # Get current link count
+    # Get current link count for this group pair
     num_links = G.existing_num_links.get((src_id, dst_id), 0)
 
     # Check if already over target
     if num_links > target_link_count:
         link_n_check = False
 
+    # Storage for destination nodes with preferential attachment
     d_nodes_bins = {}
 
-    # REVERSE LOOKUP OPTIMIZATION: Use pre-computed communities if provided
-
+    # Use precomputed communities for this group pair
     possible_communities = valid_communities
 
     if not possible_communities:
         return link_n_check
 
-    # OPTIMIZATION 2: Lazy initialization of node lists (O(1) upfront cost)
+    # Cache for source node lists by community (created as needed)
     src_node_lists = {}
 
-    # OPTIMIZATION 1: Batch community selection for faster sampling
+    # Preselect communities in batches for efficiency
     batch_size = 10000
     community_batch = np.random.choice(possible_communities, size=batch_size, replace=True)
     batch_idx = 0
 
-    # Run until target is reached
+    # Create edges until we reach the target
     while num_links < target_link_count and attempts < max_attempts:
 
-        # Use pre-selected community from batch
+        # Get next community from the batch
         community_id = community_batch[batch_idx]
         batch_idx += 1
 
-        # Refill batch if exhausted
+        # Refill batch when exhausted
         if batch_idx >= batch_size:
             community_batch = np.random.choice(possible_communities, size=batch_size, replace=True)
             batch_idx = 0
 
-        # LAZY INITIALIZATION: Create bins only when community is first used
+        # Initialize node lists for this community on first use
         if community_id not in src_node_lists:
-            # Cache source nodes for this community
+            # Get source nodes in this community
             src_node_lists[community_id] = G.communities_to_nodes[(community_id, src_id)]
 
-            # Create preferential attachment bin for destination nodes
+            # Create initial pool of destination nodes for preferential attachment
             dst_community_nodes = G.communities_to_nodes[(community_id, dst_id)]
             if dst_community_nodes:
-                d_nodes_bins[community_id] = list(np.random.choice(dst_community_nodes, size=(math.ceil(len(dst_community_nodes)*fraction)), replace=False))
+                sample_size = math.ceil(len(dst_community_nodes) * fraction)
+                d_nodes_bins[community_id] = list(np.random.choice(dst_community_nodes,
+                                                                   size=sample_size,
+                                                                   replace=False))
 
-        # Use cached node lists (O(1) dictionary lookup)
+        # Select random source and destination nodes from this community
         s = random.choice(src_node_lists[community_id])
         d_from_db = random.choice(d_nodes_bins[community_id])
 
-        # Use NetworkX directly - no self-loops, no duplicates
+        # Add edge if valid (no self-loops, no duplicates)
         if s != d_from_db and not G.graph.has_edge(s, d_from_db):
             G.graph.add_edge(s, d_from_db)
             num_links += 1
@@ -104,10 +111,7 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
                         num_links += 1
                         G.existing_num_links[(src_id, dst_id)] = num_links
 
-                    
-
-            # Preferential attachment with bounded growth
-            # With probability (1-fraction), add the chosen node again (preferential attachment)
+            # Preferential attachment: add popular nodes back to the pool
             if random.uniform(0,1) > fraction and fraction != 1:
                 d_nodes_bins[community_id].append(d_from_db)
 
@@ -127,15 +131,14 @@ def establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
                             if n_id == dst_id:
                                 num_links += 1
                                 G.existing_num_links[(src_id, dst_id)] = num_links
-                                    # Reciprocity
+                            # Reciprocity
                             if random.uniform(0,1) < reciprocity_p:
-                                if not G.graph.has_edge(n, s):
+                                if not G.graph.has_edge(n, s) and G.existing_num_links[(n_id, src_id)] < G.maximum_num_links[(n_id, src_id)]:
                                     G.graph.add_edge(n, s)
                                     G.existing_num_links[(n_id, src_id)] += 1
                                     if (n_id == src_id) & (src_id == dst_id):
                                         num_links += 1
                                         G.existing_num_links[(src_id, dst_id)] = num_links
-
 
         attempts += 1
 

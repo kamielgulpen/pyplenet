@@ -24,40 +24,42 @@ Examples
 import os
 import math
 import shutil
+import random
 
 import numpy as np
+import networkx as nx
 
 from pyplenet_nx.core.utils import (find_nodes, read_file, desc_groups)
 from pyplenet_nx.core.grn import establish_links
 from pyplenet_nx.core.graph import NetworkXGraph
-import networkx as nx
 
-import pandas as pd
-import numpy as np
-import networkx as nx
-from scipy.cluster.hierarchy import linkage, fcluster
-from collections import defaultdict
-
-def build_group_pair_to_communities_lookup(G):
+def build_group_pair_to_communities_lookup(G, verbose=False):
     """
-    Build reverse lookup: (src_group, dst_group) -> [valid_community_ids]
+    Create a lookup dictionary mapping each group pair to their shared communities.
 
-    This is computed ONCE and eliminates the O(n_communities) check
-    for every link attempt.
+    This precomputes which communities contain which group pairs, making link
+    creation much faster by avoiding repeated community membership checks.
+
+    Parameters
+    ----------
+    G : NetworkXGraph
+        Graph object with community information
+    verbose : bool, optional
+        Whether to print progress information
 
     Returns
     -------
-    dict : (src_id, dst_id) -> list of community IDs
+    dict
+        Mapping from (src_id, dst_id) to list of shared community IDs
     """
-    print("Building reverse lookup for community membership...")
+    if verbose:
+        print("Building community lookup for group pairs...")
 
     group_pair_to_communities = {}
 
-    # For each community, get all group pairs within it
     for community_id in range(G.number_of_communities):
         groups_in_community = set(G.communities_to_groups.get(community_id, []))
 
-        # Create pairs from all groups in this community
         for src_id in groups_in_community:
             for dst_id in groups_in_community:
                 pair_key = (src_id, dst_id)
@@ -67,102 +69,149 @@ def build_group_pair_to_communities_lookup(G):
 
                 group_pair_to_communities[pair_key].append(community_id)
 
-    print(f"  Cached {len(group_pair_to_communities)} group pair -> community mappings")
-    print(f"  Average communities per pair: {np.mean([len(v) for v in group_pair_to_communities.values()]):.1f}")
+    if verbose:
+        avg_communities = np.mean([len(v) for v in group_pair_to_communities.values()])
+        print(f"  Found {len(group_pair_to_communities)} group pairs")
+        print(f"  Average communities per pair: {avg_communities:.1f}")
 
     return group_pair_to_communities
 
-def populate_communities(G, x, selected_indices):
+def populate_communities(G, num_communities, seed_groups):
+    """
+    Assign nodes to communities based on group affinity patterns.
 
+    Each node is assigned to a community probabilistically, with a bias towards
+    placing similar groups in the same community. Seed groups help initialize
+    community structure.
+
+    Parameters
+    ----------
+    G : NetworkXGraph
+        Graph object with nodes and group assignments
+    num_communities : int
+        Number of communities to create
+    seed_groups : list
+        Initial group IDs to seed each community
+    """
     n_groups = int(np.sqrt(len(G.maximum_num_links)))
 
-    # Build affinity matrix
-    community_matrix = np.ones((x, n_groups))
+    # Initialize community affinity matrix with slight bias
+    community_matrix = np.ones((num_communities, n_groups))
 
+    # Initialize storage dictionaries
     communities_to_nodes = {}
     nodes_to_communities = {}
     communities_to_groups = {}
-    if x == 1 : selected_indices = [selected_indices[0]]
-    for count, group in enumerate(selected_indices):
-        # introduce bias based on selected indices
-        community_matrix[count,group] += 1
-        for i in range(n_groups):
-            communities_to_nodes[(count,i)] = []
 
-        communities_to_groups[count] = []
+    # Handle single community case
+    if num_communities == 1:
+        seed_groups = [seed_groups[0]]
 
+    # Set up initial community structure with seed groups
+    for community_idx, seed_group in enumerate(seed_groups):
+        community_matrix[community_idx, seed_group] += 1
+        for group_id in range(n_groups):
+            communities_to_nodes[(community_idx, group_id)] = []
+        communities_to_groups[community_idx] = []
+
+    # Assign each node to a community based on group probabilities
     for node in G.graph.nodes:
         group = G.nodes_to_group[node]
         probability_vector = G.probability_matrix[group]
 
-        group_probabilities = np.dot(community_matrix, probability_vector) 
-        group_probabilities = group_probabilities / (group_probabilities.sum())
-        community = np.random.choice(x, p=group_probabilities)
-        community_matrix[community,group] += 1
-        communities_to_nodes[(community,group)].append(node)
+        # Calculate community assignment probabilities
+        group_probabilities = np.dot(community_matrix, probability_vector)
+        group_probabilities = group_probabilities / group_probabilities.sum()
+
+        # Assign node to community
+        community = np.random.choice(num_communities, p=group_probabilities)
+
+        # Update community information
+        community_matrix[community, group] += 1
+        communities_to_nodes[(community, group)].append(node)
         nodes_to_communities[node] = community
         communities_to_groups[community].append(group)
 
+    # Store community assignments in graph
     G.communities_to_nodes = communities_to_nodes
     G.nodes_to_communities = nodes_to_communities
     G.communities_to_groups = communities_to_groups
  
 
-def find_separated_groups(G, x):
+def find_separated_groups(G, num_communities, verbose=False):
     """
-    Find x groups that should be in different communities (lowest inter-connections).
-    
-    Parameters:
-    - df: DataFrame with edge counts between groups
-    - x: Number of groups to return
-    
-    Returns:
-    - List of x groups that have minimal connections
+    Identify groups with minimal inter-connections to seed communities.
+
+    Uses a greedy algorithm to find groups that are least connected to each other,
+    which helps create well-separated community structure.
+
+    Parameters
+    ----------
+    G : NetworkXGraph
+        Graph object with maximum link counts between groups
+    num_communities : int
+        Number of communities to create
+    verbose : bool, optional
+        Whether to print progress information
+
+    Returns
+    -------
+    list
+        Group IDs selected as community seeds
     """
     n_groups = int(np.sqrt(len(G.maximum_num_links)))
 
-    # Build affinity matrix
+    # Create affinity matrix from link counts
     affinity = np.zeros((n_groups, n_groups))
-    for edges in G.maximum_num_links:
-        i,j = edges
-        affinity[i, j] = G.maximum_num_links[edges]
-    
+    for (i, j), count in G.maximum_num_links.items():
+        affinity[i, j] = count
+
+    # Normalize affinity to get probability matrix
     epsilon = 1e-5
     normalized = affinity / (affinity.sum(axis=1, keepdims=True) + epsilon)
     normalized[normalized == 0] = epsilon
-    G.probability_matrix = normalized.copy()
-    G.number_of_communities = x
 
-    # Greedy selection: start with two least connected groups
+    # Store for later use in community assignment
+    G.probability_matrix = normalized.copy()
+    G.number_of_communities = num_communities
+
+    # Start greedy selection with two least connected groups
     selected_indices = []
     remaining = set(range(n_groups))
-    
-    # Find pair with minimum connection
+
+    # Find the pair of groups with weakest connection
     np.fill_diagonal(normalized, np.inf)
     min_i, min_j = np.unravel_index(np.argmin(normalized), normalized.shape)
     selected_indices.extend([min_i, min_j])
     remaining.discard(min_i)
     remaining.discard(min_j)
-    
-    # Add groups with minimum total connection to selected groups
-    while len(selected_indices) < min(x, n_groups):
+
+    # Iteratively add groups that are minimally connected to already selected groups
+    while len(selected_indices) < min(num_communities, n_groups):
         min_total = np.inf
         best_group = None
-        
-        for g in remaining:
-            total_connection = normalized[g, selected_indices].sum()
+
+        for candidate_group in remaining:
+            total_connection = normalized[candidate_group, selected_indices].sum()
             if total_connection < min_total:
                 min_total = total_connection
-                best_group = g
-        
+                best_group = candidate_group
+
         selected_indices.append(best_group)
         remaining.discard(best_group)
-    
-    extend_selected_indices = selected_indices*x
-    diff = x - len(selected_indices)
-    if diff > 0 : selected_indices.extend(extend_selected_indices[:diff])
-    print(diff, selected_indices[:diff], (len(selected_indices)), x)
-    populate_communities(G, x, selected_indices)
+
+    # If we need more seeds than available groups, cycle through the selected ones
+    if len(selected_indices) < num_communities:
+        extended = selected_indices * num_communities
+        diff = num_communities - len(selected_indices)
+        selected_indices.extend(extended[:diff])
+
+    if verbose:
+        print(f"Selected {len(selected_indices)} seed groups for {num_communities} communities")
+
+    # Assign nodes to communities based on selected seed groups
+    populate_communities(G, num_communities, selected_indices)
+
     return selected_indices
 
 def init_nodes(G, pops_path, scale = 1):
@@ -217,140 +266,128 @@ def init_nodes(G, pops_path, scale = 1):
     group_ids = list(group_to_attrs.keys())
     G.existing_num_links = {(src, dst): 0 for src in group_ids for dst in group_ids}
 
-def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p, number_of_communities):
+def init_links(G, links_path, fraction, scale, reciprocity_p, transitivity_p,
+               number_of_communities, verbose=True):
     """
-    Initialize edges in the graph based on interaction data.
-    
-    Reads interaction/link data from a file and creates edges between nodes
-    based on group attributes. Uses preferential attachment and supports
-    reciprocal edge creation. The number of links is scaled by scale^2.
-    
+    Create edges in the graph based on interaction data.
+
+    Reads interaction patterns from a file and creates edges between nodes
+    according to group relationships. Supports preferential attachment,
+    reciprocity, and community-based link creation.
+
     Parameters
     ----------
     G : NetworkXGraph
-        The graph object with nodes already initialized.
+        Graph object with nodes already initialized
     links_path : str
-        Path to the links/interactions data file. Can be CSV or Excel format.
+        Path to interactions file (CSV or Excel)
     fraction : float
-        Fraction parameter for preferential attachment in establish_links().
-        Value between 0 and 1, controls the distribution of connections.
+        Preferential attachment parameter (0-1)
     scale : float
-        Scaling factor applied to the population. Link scaling = scale^2.
+        Population scaling factor
     reciprocity_p : float
-        Probability of creating reciprocal edges. Value between 0 and 1.
-        
-    Notes
-    -----
-    The function processes each row in the links file:
-    - Extracts source and destination group attributes (columns ending with '_src' and '_dst')
-    - Finds nodes matching these attributes using find_nodes()
-    - Establishes the requested number of links using establish_links()
-    - Tracks warnings for cases where existing links exceed requests
-    
-    Link scaling uses scale^2 because both source and destination populations
-    are scaled by the same factor, so the interaction potential scales quadratically.
-    
-    Progress is displayed during processing, showing current row number.
-    
-    Examples
-    --------
-    >>> init_links(G, "interactions.xlsx", fraction=0.4, scale=0.1, reciprocity_p=0.2)
-    Row 5 of 20
-    Total requested links: 1250
+        Probability of creating reciprocal edges (0-1)
+    transitivity_p : float
+        Probability of creating transitive edges (0-1)
+    number_of_communities : int
+        Number of communities to create
+    verbose : bool, optional
+        Whether to print progress information
     """
-    
-    check_bool = True
     warnings = []
-
     df_n_group_links = read_file(links_path)
-    links_scale = scale
 
-    print("Preparing maximum number of linkes")
-    G.maximum_num_links = {}
+    if verbose:
+        print("Calculating link requirements...")
 
-    requested_links = []
-    group_ids = range(240)  # or whatever your group IDs are
+    # Initialize maximum link counts for all group pairs
+    group_ids = range(240)
     G.maximum_num_links = {(i, j): 0 for i in group_ids for j in group_ids}
+
+    # Calculate required links for each group pair
     for idx, row in df_n_group_links.iterrows():
         src_attrs = {k.replace('_src', ''): row[k] for k in row.index if k.endswith('_src')}
         dst_attrs = {k.replace('_dst', ''): row[k] for k in row.index if k.endswith('_dst')}
 
         src_nodes, src_id = find_nodes(G, **src_attrs)
-        dst_nodes, dst_id = find_nodes(G,**dst_attrs)
+        dst_nodes, dst_id = find_nodes(G, **dst_attrs)
 
+        G.maximum_num_links[(src_id, dst_id)] = int(math.ceil(row['n'] * scale))
 
-        G.maximum_num_links[(src_id, dst_id)] = int(math.ceil(row['n'] * links_scale))
-        requested_links.append(int(math.ceil(row['n'] * links_scale)))
-    
-    print(f"Total requested links: {sum(requested_links)}")
+    if verbose:
+        total_links = sum(G.maximum_num_links.values())
+        print(f"Total requested links: {total_links}")
 
-    print(find_separated_groups(G, number_of_communities))
+    # Create community structure
+    find_separated_groups(G, number_of_communities, verbose=verbose)
 
-    # REVERSE LOOKUP OPTIMIZATION: Build lookup once
-    group_pair_to_communities = build_group_pair_to_communities_lookup(G)
+    # Build lookup for efficient community-based link creation
+    group_pair_to_communities = build_group_pair_to_communities_lookup(G, verbose=verbose)
 
+    # Create links for each group pair
     total_rows = len(df_n_group_links)
     for idx, row in df_n_group_links.iterrows():
 
-        if (idx + 1) % 100 == 0 or idx == 0 or idx == total_rows - 1:
-            print(f"\rRow {idx + 1} of {total_rows}", end="")
+        if verbose and ((idx + 1) % 500 == 0 or idx == 0 or idx == total_rows - 1):
+            print(f"\rProcessing row {idx + 1} of {total_rows}", end="")
 
-
-        # Extract source and destination attributes
         src_attrs = {k.replace('_src', ''): row[k] for k in row.index if k.endswith('_src')}
         dst_attrs = {k.replace('_dst', ''): row[k] for k in row.index if k.endswith('_dst')}
 
-        num_requested_links = int(math.ceil(row['n'] * links_scale))
+        num_requested_links = int(math.ceil(row['n'] * scale))
 
-        # Find nodes matching the attributes
         src_nodes, src_id = find_nodes(G, **src_attrs)
         dst_nodes, dst_id = find_nodes(G, **dst_attrs)
 
         if not src_nodes or not dst_nodes:
-            print("Group empty")
             continue
 
-        # REVERSE LOOKUP: Get pre-computed valid communities for this pair
+        # Get valid communities for this group pair
         valid_communities = group_pair_to_communities.get((src_id, dst_id), [])
 
-        # Connect the nodes (with pre-computed communities)
-        check_bool = establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
-                    num_requested_links, fraction, reciprocity_p, transitivity_p, valid_communities)
-        
-        if not check_bool:
-            existing_links = G.existing_num_links[(src_id, dst_id)]
-            warnings.append(f"Row {idx} || Groups ({src_id})->({dst_id}) || {existing_links} >> {num_requested_links}")
-    print()
-    warnings == False
-    if warnings:
-        print("Warnings:")
-        for warning in warnings:
-            print(warning)
+        # Create links between the groups
+        link_success = establish_links(G, src_nodes, dst_nodes, src_id, dst_id,
+                                      num_requested_links, fraction, reciprocity_p,
+                                      transitivity_p, valid_communities)
 
-def fill_unfulfilled_group_pairs(G, reciprocity_p):
+        if not link_success:
+            existing_links = G.existing_num_links[(src_id, dst_id)]
+            warnings.append(f"Groups ({src_id})-({dst_id}): {existing_links} exceeds target {num_requested_links}")
+
+    if verbose:
+        print()
+        if warnings:
+            print(f"\nWarnings ({len(warnings)} group pairs):")
+            for warning in warnings[:10]:  # Show first 10 warnings
+                print(f"  {warning}")
+            if len(warnings) > 10:
+                print(f"  ... and {len(warnings) - 10} more")
+
+def fill_unfulfilled_group_pairs(G, reciprocity_p, verbose=True):
     """
-    For each group pair that hasn't reached its maximum number of edges,
-    randomly create edges between nodes from source and destination groups.
+    Complete any group pairs that didn't reach their target edge count.
+
+    Randomly creates edges between nodes from unfulfilled group pairs until
+    targets are met or maximum attempts are reached.
 
     Parameters
     ----------
     G : NetworkXGraph
-        The graph object with existing edges
+        Graph object with existing edges
     reciprocity_p : float
         Probability of creating reciprocal edges (0-1)
+    verbose : bool, optional
+        Whether to print progress information
 
     Returns
     -------
     dict
-        Statistics about fulfilled and unfulfilled group pairs
+        Statistics about the filling process
     """
-    import random
-
-    print("\nFilling unfulfilled group pairs...")
-    print("-" * 50)
+    if verbose:
+        print("\nFilling unfulfilled group pairs...")
 
     unfulfilled_pairs = []
-    fulfilled_pairs = []
     stats = {
         'total_pairs': 0,
         'fulfilled_pairs': 0,
@@ -359,7 +396,7 @@ def fill_unfulfilled_group_pairs(G, reciprocity_p):
         'reciprocal_edges_added': 0
     }
 
-    # Calculate and display stats for each group pair
+    # Identify which group pairs need more edges
     for (src_id, dst_id) in G.maximum_num_links.keys():
         existing = G.existing_num_links.get((src_id, dst_id), 0)
         maximum = G.maximum_num_links[(src_id, dst_id)]
@@ -369,26 +406,25 @@ def fill_unfulfilled_group_pairs(G, reciprocity_p):
         if maximum == 0:
             continue
 
+        # Only try to fill pairs that are genuinely under the target
         if existing < maximum:
             unfulfilled_pairs.append((src_id, dst_id, existing, maximum))
             stats['unfulfilled_pairs'] += 1
         else:
-            fulfilled_pairs.append((src_id, dst_id, existing, maximum))
             stats['fulfilled_pairs'] += 1
 
-    print(f"Total group pairs: {stats['total_pairs']}")
-    print(f"Fulfilled pairs: {stats['fulfilled_pairs']}")
-    print(f"Unfulfilled pairs: {stats['unfulfilled_pairs']}")
-    print()
+    if verbose:
+        print(f"  Total pairs: {stats['total_pairs']}")
+        print(f"  Fulfilled: {stats['fulfilled_pairs']}")
+        print(f"  Unfulfilled: {stats['unfulfilled_pairs']}")
 
-    # Fill unfulfilled pairs
+    # Add random edges to complete unfulfilled pairs
+    partially_filled = 0
     if unfulfilled_pairs:
-        print("Filling unfulfilled pairs with random edges...")
-
         for src_id, dst_id, existing, maximum in unfulfilled_pairs:
+            existing = G.existing_num_links.get((src_id, dst_id), 0)
+            maximum = G.maximum_num_links.get((src_id, dst_id), 0)
             needed = maximum - existing
-
-            # Get nodes from source and destination groups
             src_nodes = G.group_to_nodes.get(src_id, [])
             dst_nodes = G.group_to_nodes.get(dst_id, [])
 
@@ -400,51 +436,43 @@ def fill_unfulfilled_group_pairs(G, reciprocity_p):
             edges_added_for_pair = 0
 
             while edges_added_for_pair < needed and attempts < max_attempts:
-                # Select random nodes
                 src_node = random.choice(src_nodes)
                 dst_node = random.choice(dst_nodes)
 
-                # Check if edge can be added (no self-loops, no duplicates)
+                # Add edge if valid (no self-loops, no duplicates)
                 if src_node != dst_node and not G.graph.has_edge(src_node, dst_node):
                     G.graph.add_edge(src_node, dst_node)
                     edges_added_for_pair += 1
                     G.existing_num_links[(src_id, dst_id)] += 1
                     stats['edges_added'] += 1
 
-                    # Add reciprocal edge with probability reciprocity_p
-                    if random.uniform(0, 1) < reciprocity_p:
-                        # Check if reciprocal pair exists and has capacity
-                        if (dst_id, src_id) in G.maximum_num_links:
-                            current_reciprocal = G.existing_num_links.get((dst_id, src_id), 0)
-                            max_reciprocal = G.maximum_num_links[(dst_id, src_id)]
-
-                            # Only add if under limit and edge doesn't exist
-                            if current_reciprocal < max_reciprocal and not G.graph.has_edge(dst_node, src_node):
-                                G.graph.add_edge(dst_node, src_node)
-                                G.existing_num_links[(dst_id, src_id)] += 1
-                                stats['reciprocal_edges_added'] += 1
-
-                                # If self-loop group pair, count it toward the main pair too
-                                if dst_id == src_id:
-                                    edges_added_for_pair += 1
-                                    stats['edges_added'] += 1
+                    # Reciprocity - same pattern as grn.py
+                    if random.uniform(0,1) < reciprocity_p:
+                        if( G.existing_num_links[(dst_id, src_id)] < G.maximum_num_links[(dst_id, src_id)] and 
+                           not G.graph.has_edge(dst_node, src_node)):
+                            G.graph.add_edge(dst_node, src_node)
+                            G.existing_num_links[(dst_id, src_id)] += 1
+                            stats['reciprocal_edges_added'] += 1
+                            if (dst_id == src_id):
+                                edges_added_for_pair += 1
+                                stats['edges_added'] += 1
 
                 attempts += 1
 
-            if edges_added_for_pair < needed:
-                print(f"  Warning: Group pair ({src_id}, {dst_id}) - "
-                      f"Only added {edges_added_for_pair}/{needed} edges "
-                      f"(reached max attempts)")
-
-    print(f"\nTotal edges added: {stats['edges_added']}")
-    print(f"Total reciprocal edges added: {stats['reciprocal_edges_added']}")
-    print("-" * 50)
+    if verbose:
+        print(f"  Edges added: {stats['edges_added']}")
+        print(f"  Reciprocal edges added: {stats['reciprocal_edges_added']}")
 
     return stats
 
-def generate(pops_path, links_path, preferential_attachment, scale, reciprocity, transitivity, number_of_communities, base_path="graph_data"):
+def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
+             transitivity, number_of_communities, base_path="graph_data", verbose=True):
     """
     Generate a population-based network using NetworkX.
+
+    Creates a network by first generating nodes from population data, then
+    establishing edges based on interaction patterns. Supports preferential
+    attachment, reciprocity, transitivity, and community structure.
 
     Parameters
     ----------
@@ -455,42 +483,82 @@ def generate(pops_path, links_path, preferential_attachment, scale, reciprocity,
     preferential_attachment : float
         Preferential attachment strength (0-1)
     scale : float
-        Population scaling factor (nodes scaled by this, links by scale^2)
+        Population scaling factor
     reciprocity : float
         Probability of reciprocal edges (0-1)
+    transitivity : float
+        Probability of transitive edges (0-1)
+    number_of_communities : int
+        Number of communities to create
     base_path : str, optional
         Directory for saving graph (default "graph_data")
+    verbose : bool, optional
+        Whether to print progress information
 
     Returns
     -------
     NetworkXGraph
-        Generated network with G.graph (nx.DiGraph) and metadata
+        Generated network with graph data and metadata
     """
-    print("Generating Nodes")
+    if verbose:
+        print("="*60)
+        print("NETWORK GENERATION")
+        print("="*60)
+        print("\nStep 1: Creating nodes from population data...")
 
+    # Prepare output directory
     if os.path.exists(base_path):
         shutil.rmtree(base_path)
     os.makedirs(base_path)
 
     G = NetworkXGraph(base_path)
 
+    # Create nodes
     init_nodes(G, pops_path, scale)
-    print(f"{G.graph.number_of_nodes()} nodes initialized")  # Use G.graph
-    print()
 
-    # Invert preferential attachment parameter
+    if verbose:
+        print(f"  Created {G.graph.number_of_nodes()} nodes")
+        print("\nStep 2: Creating edges from interaction patterns...")
+
+    # Invert preferential attachment for internal representation
     preferential_attachment_fraction = 1 - preferential_attachment
 
-    print("Generating Links")
-    print("-----------------")
-    init_links(G, links_path, preferential_attachment_fraction, scale, reciprocity, transitivity, number_of_communities)
-    print("-----------------")
-    print("Network Generated")
-    print()
+    # Create edges
+    init_links(G, links_path, preferential_attachment_fraction, scale,
+              reciprocity, transitivity, number_of_communities, verbose=verbose)
 
-    # Fill any unfulfilled group pairs with random edges
-    fill_unfulfilled_group_pairs(G, reciprocity)
+    if verbose:
+        print("\nStep 3: Filling remaining unfulfilled group pairs...")
 
+    # Complete any group pairs that didn't reach their target
+    fill_unfulfilled_group_pairs(G, reciprocity, verbose=verbose)
+
+    # Save to disk
     G.finalize()
+
+    if verbose:
+        # Calculate link fulfillment statistics
+        total_requested = sum(G.maximum_num_links.values())
+        total_created = sum(G.existing_num_links.values())
+        fulfillment_rate = (total_created / total_requested * 100) if total_requested > 0 else 0
+
+        # Count overfulfilled pairs
+        overfulfilled = sum(1 for (src, dst) in G.maximum_num_links.keys()
+                           if G.existing_num_links.get((src, dst), 0) > G.maximum_num_links[(src, dst)])
+
+        print(f"\n{'='*60}")
+        print(f"NETWORK GENERATION COMPLETE")
+        print(f"{'='*60}")
+        print(f"Nodes: {G.graph.number_of_nodes()}")
+        print(f"Edges: {G.graph.number_of_edges()}")
+        print(f"\nLink Fulfillment:")
+        print(f"  Requested: {total_requested}")
+        print(f"  Created: {total_created}")
+        print(f"  Difference: {total_created - total_requested:+d}")
+        print(f"  Rate: {fulfillment_rate:.1f}%")
+        if overfulfilled > 0:
+            print(f"  Overfulfilled pairs: {overfulfilled}")
+        print(f"\nSaved to: {base_path}")
+        print(f"{'='*60}\n")
 
     return G
